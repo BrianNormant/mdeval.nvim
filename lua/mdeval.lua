@@ -1,8 +1,8 @@
 local defaults = require("defaults")
 
-local vim = vim
 local api = vim.api
 local fn = vim.fn
+local uv = vim.uv
 
 local M = {}
 
@@ -105,29 +105,72 @@ local function run_compiler(command, extension, temp_filename, code, timeout)
   return result, true
 end
 
-local function run_interpreter(command, extension, temp_filename, code, timeout)
-  assert(command ~= nil)
-  local filepath = string.format("%s/%s", M.opts.tmp_build_dir, temp_filename)
-  local src_filepath = string.format("%s.%s", filepath, extension)
+local function run_interpreter(command, code, opts)
+  opts = opts or {}
 
-  local f = io.open(src_filepath, "w")
-  f:write(code)
-  f:close()
-
-  local cmd = string.format("%s %s", table.concat(command, " "), src_filepath)
-  local handle
-  if timeout ~= -1 then
-    handle = io.popen(get_timeout_command(cmd, timeout))
-  else
-    handle = io.popen(get_command(string.format("%s 2>&1", cmd)))
-  end
   local result = {}
-  local lastline
-  for line in handle:lines() do
-    result[#result + 1] = line
-    lastline = line
+  local finished = false
+
+  local stdin = uv.new_pipe()
+  local stdout = uv.new_pipe()
+  assert(stdin, "Failed to create stdin pipe")
+  assert(stdout, "Failed to create stdout pipe")
+
+  local handle, _= uv.spawn(command[1], {
+    args = { unpack(command, 2) },
+    stdio = { stdin, stdout, nil }
+  }, function()
+    finished = true
+    stdin:close()
+    stdout:close()
+  end)
+  assert(handle, "Failed to spawn process")
+
+  uv.read_start(stdout, function(err, data)
+    assert(not err, err)
+    if data then
+      if opts.filter(data) then
+        result[#result+1] = data
+      end
+    end
+  end)
+
+  local lines = {}
+  for s in code:gmatch("[^\r\n]+") do
+    table.insert(lines, s)
   end
 
+  for i, line in ipairs(lines) do
+    if i == #code then
+      uv.write(stdin, line .. "\n", function() finished = true end)
+    else
+      uv.write(stdin, line .. "\n", function() end)
+    end
+  end
+
+  uv.close(handle, function() end)
+
+  local timeout = 1000
+  if command == 'java' then
+    timeout = 2000
+  end
+
+  -- Wait for the process to finish
+  vim.fn.wait(timeout, function()
+    return finished
+  end, 50)
+
+  result = {unpack(
+    result,
+    opts.ignore_first_line + 1,
+    #result - opts.ignore_last_line
+  )}
+
+  result = vim.tbl_map(function(k)
+    k = vim.inspect(k) -- Didn't find a better way to sanitize the output
+    k = string.sub(k, 2, -2)
+    return k
+  end, result)
   return result, true
 end
 
@@ -151,6 +194,18 @@ local function find_lang_options(lang_code)
       break
     end
   end
+
+  lang_options.ignore_first_line = lang_options.ignore_first_line or false
+  lang_options.ignore_last_line = lang_options.ignore_last_line or false
+
+  if type(lang_options.ignore_first_line) == "boolean" then
+    lang_options.ignore_first_line = lang_options.ignore_first_line and 1 or 0
+  end
+
+  if type(lang_options.ignore_last_line) == "boolean" then
+    lang_options.ignore_last_line = lang_options.ignore_last_line and 1 or 0
+  end
+
   return lang_name, lang_options
 end
 
@@ -176,10 +231,12 @@ local function eval_code(lang_name, lang_options, temp_filename, code, timeout)
   elseif lang_options.exec_type == "interpreted" then
     return run_interpreter(
       lang_options.command,
-      lang_options.extension,
-      temp_filename,
       code,
-      timeout
+      {
+        filter = lang_options.filter or function() return true end,
+        ignore_first_line = lang_options.ignore_first_line,
+        ignore_last_line = lang_options.ignore_last_line,
+      }
     )
   end
 
