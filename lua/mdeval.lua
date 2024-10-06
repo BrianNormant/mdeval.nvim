@@ -161,6 +161,9 @@ local function eval_code(lang_name, lang_options, temp_filename, code, timeout)
   if lang_options.default_header then
     code = lang_options.default_header .. "\n" .. code
   end
+  if lang_options.default_footer then
+    code = code .. "\n" .. lang_options.default_footer
+  end
 
   if lang_options.exec_type == "compiled" then
     return run_compiler(
