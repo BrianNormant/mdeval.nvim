@@ -1,5 +1,6 @@
 local defaults = require("defaults")
 
+local vim = vim
 local api = vim.api
 local fn = vim.fn
 local uv = vim.uv
@@ -52,7 +53,7 @@ local function get_timeout_command(cmd, timeout)
   )
 end
 
-local function run_compiler(command, extension, temp_filename, code, timeout)
+local function run_compiler(command, extension, temp_filename, code, timeout, cb)
   assert(command ~= nil)
   local filepath = string.format("%s/%s", M.opts.tmp_build_dir, temp_filename)
   local src_filepath = string.format("%s.%s", filepath, extension)
@@ -102,76 +103,72 @@ local function run_compiler(command, extension, temp_filename, code, timeout)
   end
   handle:close()
 
-  return result, true
+  cb(result)
 end
 
-local function run_interpreter(command, code, opts)
+local function run_interpreter(command, code, eof, opts, cb)
   opts = opts or {}
 
   local result = {}
-  local finished = false
 
   local stdin = uv.new_pipe()
   local stdout = uv.new_pipe()
+  local stderr = uv.new_pipe()
   assert(stdin, "Failed to create stdin pipe")
   assert(stdout, "Failed to create stdout pipe")
 
-  local handle, _= uv.spawn(command[1], {
-    args = { unpack(command, 2) },
-    stdio = { stdin, stdout, nil }
+  local handle, _ = uv.spawn('stdbuf', {
+    args = { '-o0', '-e0', unpack(command) },
+    stdio = { stdin, stdout, stderr },
   }, function()
-    finished = true
     stdin:close()
     stdout:close()
+    stderr:close()
+
+    cb("```")
   end)
   assert(handle, "Failed to spawn process")
 
   uv.read_start(stdout, function(err, data)
     assert(not err, err)
     if data then
-      if opts.filter(data) then
-        result[#result+1] = data
+      for _, s in ipairs(vim.split(data, "\n", {trimempty=true})) do
+        if opts.filter(s) then
+          if opts.ignore_first_line > 0 then
+            opts.ignore_first_line = opts.ignore_first_line - 1
+            goto ignored
+          end
+
+          s = vim.inspect(s)
+          s = string.sub(s, 2, -2)
+          cb(s)
+        end
+        ::ignored::
       end
     end
   end)
 
-  local lines = {}
-  for s in code:gmatch("[^\r\n]+") do
-    table.insert(lines, s)
-  end
+  cb("")
+  cb(M.opts.results_label)
+  cb(code_block_start())
 
-  for i, line in ipairs(lines) do
-    if i == #code then
-      uv.write(stdin, line .. "\n", function() finished = true end)
-    else
-      uv.write(stdin, line .. "\n", function() end)
+  local lines = vim.split(code, "\n")
+  lines[#lines+1] = eof .. "\n"
+
+  local line_num = 1
+  local function print_next_line()
+    if line_num > #lines then
+      return
     end
+    uv.write(stdin, lines[line_num] .. "\n")
+    line_num = line_num + 1
+    vim.defer_fn(function()
+      print_next_line()
+    end, 100)
   end
 
-  uv.close(handle, function() end)
+  print_next_line()
 
-  local timeout = 1000
-  if command == 'java' then
-    timeout = 2000
-  end
-
-  -- Wait for the process to finish
-  vim.fn.wait(timeout, function()
-    return finished
-  end, 50)
-
-  result = {unpack(
-    result,
-    opts.ignore_first_line + 1,
-    #result - opts.ignore_last_line
-  )}
-
-  result = vim.tbl_map(function(k)
-    k = vim.inspect(k) -- Didn't find a better way to sanitize the output
-    k = string.sub(k, 2, -2)
-    return k
-  end, result)
-  return result, true
 end
 
 -- Finds the appropriate language entry in the options tables and its name.
@@ -209,7 +206,12 @@ local function find_lang_options(lang_code)
   return lang_name, lang_options
 end
 
-local function eval_code(lang_name, lang_options, temp_filename, code, timeout)
+local function eval_code(lang_name, lang_options, temp_filename, code, timeout, cb)
+  if lang_options.exec_type == nil then
+    error(string.format("Execution type for %s unset.", lang_name))
+    error("Please set one of the: compiled and interpreted one.")
+  end
+
   create_tmp_build_dir()
 
   -- Prepend generated code with the default_header.
@@ -221,39 +223,27 @@ local function eval_code(lang_name, lang_options, temp_filename, code, timeout)
   end
 
   if lang_options.exec_type == "compiled" then
-    return run_compiler(
+    run_compiler(
       lang_options.command,
       lang_options.extension,
       temp_filename,
       code,
-      timeout
+      timeout,
+      cb
     )
   elseif lang_options.exec_type == "interpreted" then
-    return run_interpreter(
+    run_interpreter(
       lang_options.command,
       code,
+      lang_options.eof,
       {
         filter = lang_options.filter or function() return true end,
         ignore_first_line = lang_options.ignore_first_line,
         ignore_last_line = lang_options.ignore_last_line,
-      }
+      },
+      cb
     )
   end
-
-  if lang.exec_type == nil then
-    error(string.format("Execution type for %s unset.", lang_name))
-    error("Please set one of the: compiled and interpreted one.")
-  else
-    error(
-      string.format(
-        "Unknown execution type for %s: %s",
-        lang_name,
-        lang.exec_type
-      )
-    )
-  end
-
-  return nil, false
 end
 
 local function generate_temp_filename(buffer_name, start_pos, end_pos)
@@ -268,7 +258,8 @@ end
 -- compilation/execution.
 -- @param linenr Number of an empty line before results header.
 local function remove_previous_output(linenr)
-  local saved_pos = fn.getpos(".")
+  
+  local saved_pos = api.nvim_win_get_cursor(0)
 
   -- Remove line with compilation results header.
   local results_linenr = linenr + 1
@@ -309,39 +300,7 @@ local function remove_previous_output(linenr)
     fn.execute(string.format("%d,%ddelete", linenr, end_linenr))
   end
 
-  fn.setpos(".", saved_pos)
-end
-
--- Writes output of the excuted command after the linenr line.
--- @param out Table containing lines from the output.
-local function write_output(linenr, out)
-  local out_table = { "" }
-  if out == nil then
-    out_table[#out_table + 1] =
-      string.format("%s `<no output>`", M.opts.results_label)
-  else
-    if #out == 1 then
-      out_table[#out_table + 1] =
-        string.format("%s `%s`", M.opts.results_label, out[1])
-    else
-      out_table[#out_table + 1] = M.opts.results_label
-      out_table[#out_table + 1] = code_block_start()
-      for _, s in pairs(out) do
-        out_table[#out_table + 1] = s:gsub("\\n", "")
-      end
-      out_table[#out_table + 1] = code_block_end()
-    end
-  end
-
-  -- Add an additional new line after the end, if it doesn't already exist.
-  if fn.getline(linenr + 1) ~= "" then
-    out_table[#out_table + 1] = ""
-  end
-
-  for _, s in pairs(out_table) do
-    fn.append(linenr, s)
-    linenr = linenr + 1
-  end
+  vim.api.nvim_win_set_cursor(0, saved_pos)
 end
 
 -- Parses start line to get code of the language.
@@ -472,12 +431,16 @@ function M:eval_code_block()
     end
   end
 
-  local temp_filename =
-    generate_temp_filename(api.nvim_buf_get_name(0), linenr_from, linenr_until)
-  local eval_output, rc =
-    eval_code(lang_name, lang_options, temp_filename, code, M.opts.exec_timeout)
-  remove_previous_output(linenr_until + 1)
-  write_output(linenr_until, eval_output)
+  local function cb(output)
+    vim.schedule(function()
+      -- remove_previous_output(linenr_until + 1)
+      -- Write output continuously.
+      fn.append(linenr_until, output)
+      linenr_until = linenr_until + 1
+    end)
+  end
+  local temp_filename = generate_temp_filename(api.nvim_buf_get_name(0), linenr_from, linenr_until)
+  eval_code(lang_name, lang_options, temp_filename, code, M.opts.exec_timeout, cb)
 end
 
 function M:eval_clean_results()
